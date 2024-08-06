@@ -67,14 +67,8 @@ class Post(BaseModel):
     content: str
     timestamp: str
     url: str
-    media: List[MediaItem]
-
-
-class Post(BaseModel):
-    author: str
-    content: str
-    timestamp: str
-    url: str
+    isAd: bool
+    media: Optional[List[MediaItem]] = None
 
 class PostStore(BaseModel):
     community: str
@@ -86,6 +80,8 @@ class Token(BaseModel):
 
 # Authentication
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+
 
 async def get_user(username: str):
     return await db.users.find_one({"username": username})
@@ -131,6 +127,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     if user is None:
         raise credentials_exception
     return user
+
+@app.exception_handler(ValidationError)
+async def validation_exception_handler(request, exc):
+    logging.error(f"Validation error: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": exc.errors()},
+    )
 
 @app.get("/", tags=["health"])
 async def health_check():
@@ -191,45 +195,53 @@ async def join_community(community: Community, current_user: dict = Depends(get_
 
 @app.post("/posts")
 async def store_posts(post_store: PostStore, current_user: dict = Depends(get_current_user)):
-    # Get all communities the user is part of
-    user_communities = await db.user_communities.find_one({"username": current_user["username"]})
-    if not user_communities or not user_communities.get("communities"):
-        raise HTTPException(status_code=400, detail="User is not part of any community")
+    try:
+        # Get all communities the user is part of
+        user_communities = await db.user_communities.find_one({"username": current_user["username"]})
+        if not user_communities or not user_communities.get("communities"):
+            raise HTTPException(status_code=400, detail="User is not part of any community")
 
-    communities = user_communities["communities"]
+        communities = user_communities["communities"]
 
-    stored_count = 0
-    duplicate_count = 0
+        stored_count = 0
+        duplicate_count = 0
+        ad_count = 0
 
-    # Store posts for each community the user is part of
-    for post in post_store.posts:
-        for community in communities:
-            # Check if this tweet already exists for this community
-            existing_tweet = await db.posts.find_one({
-                "community": community,
-                "url": post.url
-            })
-
-            if not existing_tweet:
-                await db.posts.insert_one({
+        # Store posts for each community the user is part of
+        for post in post_store.posts:
+            for community in communities:
+                # Check if this tweet already exists for this community
+                existing_tweet = await db.posts.find_one({
                     "community": community,
-                    "author": post.author,
-                    "content": post.content,
-                    "timestamp": post.timestamp,
-                    "url": post.url,
-                    "media": [media.dict() for media in post.media],  # Store media information
-                    "scraped_by": current_user["username"],
-                    "scraped_at": datetime.utcnow()
+                    "url": post.url
                 })
-                stored_count += 1
-            else:
-                duplicate_count += 1
 
-    return {
-        "message": f"Processed {len(post_store.posts)} posts for {len(communities)} communities",
-        "stored": stored_count,
-        "duplicates": duplicate_count
-    }
+                if not existing_tweet:
+                    await db.posts.insert_one({
+                        "community": community,
+                        "author": post.author,
+                        "content": post.content,
+                        "timestamp": post.timestamp,
+                        "url": post.url,
+                        "media": [media.dict() for media in post.media],  # Store media information
+                        "scraped_by": current_user["username"],
+                        "scraped_at": datetime.utcnow()
+                    })
+                    stored_count += 1
+                else:
+                    duplicate_count += 1
+                if post.isAd:
+                    ad_count += 1
+
+        return {
+            "message": f"Processed {len(post_store.posts)} posts for {len(communities)} communities",
+            "stored": stored_count,
+            "duplicates": duplicate_count,
+            "ads": ad_count
+        }
+    except Exception as e:
+        logging.error(f"Error processing posts: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An error occurred while processing posts: {str(e)}")
 
 @app.get("/search")
 async def search_posts(query: str, community: str, has_media: bool = False, current_user: dict = Depends(get_current_user)):

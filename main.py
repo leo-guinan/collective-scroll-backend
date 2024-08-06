@@ -11,6 +11,7 @@ import jwt
 from motor.motor_asyncio import AsyncIOMotorClient
 import bcrypt
 from urllib.parse import quote_plus
+from decouple import config
 
 app = FastAPI()
 
@@ -30,24 +31,14 @@ app.add_middleware(
 )
 
 # Configuration
-SECRET_KEY = "your-secret-key"  # Change this!
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+MONGO_URI = config("MONGO_URI")
+SECRET_KEY = config("SECRET_KEY")
+ALGORITHM = config("ALGORITHM", default="HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = config("ACCESS_TOKEN_EXPIRE_MINUTES", default=30, cast=int)
 
-MONGO_USERNAME = "mongoadmin"
-MONGO_PASSWORD = "supersecret"
-MONGO_HOST = "localhost"
-MONGO_PORT = "27017"
-MONGO_DB_NAME = "collective_scrolling"
-
-# URL encode the username and password
-MONGO_USERNAME = quote_plus(MONGO_USERNAME)
-MONGO_PASSWORD = quote_plus(MONGO_PASSWORD)
 
 # Construct the MongoDB connection string
-MONGO_URL = f"mongodb://mongoadmin:supersecret@mongo:27017"
-
-client = AsyncIOMotorClient(MONGO_URL)
+client = AsyncIOMotorClient(MONGO_URI)
 db = client.collective_scrolling
 
 # Models

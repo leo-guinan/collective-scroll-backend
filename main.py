@@ -233,4 +233,4 @@ async def search_posts(query: str, community: str, has_media: bool = False, curr
     return results
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=config("PORT", default=8000, cast=int))

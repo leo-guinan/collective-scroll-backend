@@ -23,9 +23,8 @@ app = FastAPI()
 
 # CORS configuration
 origins = [
-    "chrome-extension://afoiocfpnfhdmfnecddgekopkloafdao",  # Replace with your actual extension ID
-    "http://localhost",
-    "http://localhost:8001",
+    "https://x.com",
+    "https://twitter.com"
 ]
 
 app.add_middleware(

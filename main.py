@@ -12,6 +12,11 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import bcrypt
 from urllib.parse import quote_plus
 from decouple import config
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 

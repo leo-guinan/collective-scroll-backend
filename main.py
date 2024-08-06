@@ -127,6 +127,25 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return user
 
+@app.get("/", tags=["health"])
+async def health_check():
+    try:
+        # Check database connection
+        await db.command("ping")
+        db_status = "healthy"
+    except Exception as e:
+        logger.error(f"Database health check failed: {str(e)}")
+        db_status = "unhealthy"
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "status": "healthy" if db_status == "healthy" else "unhealthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "database": db_status,
+        }
+    )
+
 # Routes
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):

@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError,EmailStr
 from typing import List, Optional
 import uvicorn
 from datetime import datetime, timedelta
@@ -14,6 +14,8 @@ import bcrypt
 from urllib.parse import quote_plus
 from decouple import config
 import logging
+import requests
+import random
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -47,12 +49,14 @@ client = AsyncIOMotorClient(MONGO_URI)
 db = client.collective_scrolling
 
 # Models
-class UserIn(BaseModel):
-    username: str
-    password: str
+class UserInDB(BaseModel):
+    email: EmailStr
+    is_verified: bool = False
 
-class UserOut(BaseModel):
-    username: str
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
 
 class Community(BaseModel):
     name: str
@@ -71,17 +75,50 @@ class Post(BaseModel):
     media: Optional[List[MediaItem]] = None
 
 class PostStore(BaseModel):
-    community: str
     posts: List[Post]
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
+class EmailRequest(BaseModel):
+    email: EmailStr
+
+class VerifyLoginRequest(BaseModel):
+    email: EmailStr
+    code: str
+
+
 # Authentication
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
+# Helper functions
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
+def send_verification_email(email: str, code: str):
+    url = "https://app.loops.so/api/v1/transactional"
+    payload = {
+        "email": email,
+        "transactionalId": config("LOOPS_TRANSACTIONAL_ID"),
+        "dataVariables": {
+            "verification_code": code
+        }
+    }
+    headers = {
+        "Authorization": f"Bearer {config('LOOPS_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    response = requests.post(url, json=payload, headers=headers)
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to send verification email")
 
 async def get_user(username: str):
     return await db.users.find_one({"username": username})
@@ -118,12 +155,12 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
+        email: str = payload.get("sub")
+        if email is None:
             raise credentials_exception
     except jwt.PyJWTError:
         raise credentials_exception
-    user = await get_user(username)
+    user = await db.users.find_one({"email": email})
     if user is None:
         raise credentials_exception
     return user
@@ -156,33 +193,37 @@ async def health_check():
     )
 
 # Routes
-@app.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = await authenticate_user(form_data.username, form_data.password)
+@app.post("/request-login")
+async def request_login(email_request: EmailRequest):
+    email = email_request.email
+    user = await db.users.find_one({"email": email})
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        # Create a new user if they don't exist
+        user = UserInDB(email=email)
+        await db.users.insert_one(user.dict())
+
+    verification_code = ''.join(random.choices('0123456789', k=6))
+    await db.verification_codes.insert_one({"email": email, "code": verification_code})
+    send_verification_email(email, verification_code)
+    return {"message": "Verification code sent to your email."}
+
+
+@app.post("/verify-login", response_model=Token)
+async def verify_login(verify_request: VerifyLoginRequest):
+    email = verify_request.email
+    code = verify_request.code
+    verification = await db.verification_codes.find_one({"email": email, "code": code})
+    if not verification:
+        raise HTTPException(status_code=400, detail="Invalid verification code")
+    
+    await db.users.update_one({"email": email}, {"$set": {"is_verified": True}})
+    await db.verification_codes.delete_one({"email": email})
+    
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user["username"]}, expires_delta=access_token_expires
+        data={"sub": email}, expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
-
-@app.post("/signup", response_model=UserOut)
-async def signup(user: UserIn):
-    existing_user = await get_user(user.username)
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username already registered"
-        )
-    hashed_password = get_password_hash(user.password)
-    new_user = {"username": user.username, "hashed_password": hashed_password}
-    await db.users.insert_one(new_user)
-    return {"username": user.username}
 
 @app.post("/community/join")
 async def join_community(community: Community, current_user: dict = Depends(get_current_user)):
@@ -196,12 +237,7 @@ async def join_community(community: Community, current_user: dict = Depends(get_
 @app.post("/posts")
 async def store_posts(post_store: PostStore, current_user: dict = Depends(get_current_user)):
     try:
-        # Get all communities the user is part of
-        user_communities = await db.user_communities.find_one({"username": current_user["username"]})
-        if not user_communities or not user_communities.get("communities"):
-            raise HTTPException(status_code=400, detail="User is not part of any community")
-
-        communities = user_communities["communities"]
+    
 
         stored_count = 0
         duplicate_count = 0
@@ -209,32 +245,30 @@ async def store_posts(post_store: PostStore, current_user: dict = Depends(get_cu
 
         # Store posts for each community the user is part of
         for post in post_store.posts:
-            for community in communities:
-                # Check if this tweet already exists for this community
-                existing_tweet = await db.posts.find_one({
-                    "community": community,
-                    "url": post.url
+           
+            # Check if this tweet already exists for this community
+            existing_tweet = await db.posts.find_one({
+                "url": post.url
+            })
+
+            if not existing_tweet:
+                await db.posts.insert_one({
+                    "author": post.author,
+                    "content": post.content,
+                    "timestamp": post.timestamp,
+                    "url": post.url,
+                    "isAd": post.isAd,
+                    "media": [media.dict() for media in (post.media or [])],
+                    "scraped_by": current_user["email"],
+                    "scraped_at": datetime.utcnow()
                 })
-
-                if not existing_tweet:
-                    await db.posts.insert_one({
-                        "community": community,
-                        "author": post.author,
-                        "content": post.content,
-                        "timestamp": post.timestamp,
-                        "url": post.url,
-                        "media": [media.dict() for media in post.media],  # Store media information
-                        "scraped_by": current_user["username"],
-                        "scraped_at": datetime.utcnow()
-                    })
-                    stored_count += 1
-                else:
-                    duplicate_count += 1
-                if post.isAd:
-                    ad_count += 1
-
+                stored_count += 1
+            else:
+                duplicate_count += 1
+            if post.isAd:
+                ad_count += 1
         return {
-            "message": f"Processed {len(post_store.posts)} posts for {len(communities)} communities",
+            "message": f"Processed {len(post_store.posts)} posts",
             "stored": stored_count,
             "duplicates": duplicate_count,
             "ads": ad_count

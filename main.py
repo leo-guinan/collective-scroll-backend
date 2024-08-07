@@ -16,6 +16,11 @@ from decouple import config
 import logging
 import requests
 import random
+import re
+from urllib.parse import urlparse
+import chromadb
+from chromadb.config import Settings
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +47,7 @@ MONGO_URI = config("MONGO_URI")
 SECRET_KEY = config("SECRET_KEY")
 ALGORITHM = config("ALGORITHM", default="HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = config("ACCESS_TOKEN_EXPIRE_MINUTES", default=30, cast=int)
-
+REFRESH_TOKEN_EXPIRE_DAYS = config("REFRESH_TOKEN_EXPIRE_DAYS", default=30, cast=int)
 
 # Construct the MongoDB connection string
 client = AsyncIOMotorClient(MONGO_URI)
@@ -92,6 +97,28 @@ class VerifyLoginRequest(BaseModel):
 # Authentication
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
+# chroma_client = chromadb.HttpClient(host=config('CHROMA_HOST'), port=8000)
+# posts_collection = chroma_client.get_or_create_collection(name="posts")
+# default_ef = embedding_functions.OpenAIEmbeddingFunction(api_key=config('OPENAI_API_KEY'),
+#                                                                 model_name="text-embedding-3-small"
+# )
+
+
+
+
+                        
+# collection = chroma_client.get_or_create_collection(name=config('COLLECTION_NAME'), embedding_function=default_ef)
+# Add these helper functions
+def extract_urls(text):
+    url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
+    return url_pattern.findall(text)
+
+def is_valid_url(url):
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except ValueError:
+        return False
 # Helper functions
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
@@ -120,8 +147,21 @@ def send_verification_email(email: str, code: str):
     if response.status_code != 200:
         raise HTTPException(status_code=500, detail="Failed to send verification email")
 
-async def get_user(username: str):
-    return await db.users.find_one({"username": username})
+async def get_user(email: str):
+    user = await db.users.find_one({"email": email})
+    if user:
+        return UserInDB(**user)
+
+async def verify_token(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            return None
+        user = await get_user(email)
+        return user
+    except JWTError:
+        return None
 
 async def authenticate_user(username: str, password: str):
     user = await get_user(username)
@@ -137,15 +177,19 @@ def verify_password(plain_password, hashed_password):
 def get_password_hash(password):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+def create_token(data: dict, expires_delta: timedelta):
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+    expire = datetime.utcnow() + expires_delta
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+def create_access_token(data: dict):
+    return create_token(data, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+
+def create_refresh_token(data: dict):
+    return create_token(data, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
+
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -219,11 +263,35 @@ async def verify_login(verify_request: VerifyLoginRequest):
     await db.users.update_one({"email": email}, {"$set": {"is_verified": True}})
     await db.verification_codes.delete_one({"email": email})
     
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": email}, expires_delta=access_token_expires
+    access_token = create_access_token(data={"sub": email})
+    refresh_token = create_refresh_token(data={"sub": email})
+    
+    # Store refresh token in database
+    await db.refresh_tokens.insert_one({"email": email, "token": refresh_token})
+    
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
+
+@app.post("/refresh", response_model=Token)
+async def refresh_token(refresh_token: str):
+    user = await verify_token(refresh_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    
+    # Check if refresh token exists in database
+    token_exists = await db.refresh_tokens.find_one({"email": user.email, "token": refresh_token})
+    if not token_exists:
+        raise HTTPException(status_code=401, detail="Refresh token has been revoked")
+    
+    new_access_token = create_access_token(data={"sub": user.email})
+    new_refresh_token = create_refresh_token(data={"sub": user.email})
+    
+    # Replace old refresh token with new one
+    await db.refresh_tokens.update_one(
+        {"email": user.email, "token": refresh_token},
+        {"$set": {"token": new_refresh_token}}
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    
+    return {"access_token": new_access_token, "refresh_token": new_refresh_token, "token_type": "bearer"}
 
 @app.post("/community/join")
 async def join_community(community: Community, current_user: dict = Depends(get_current_user)):
